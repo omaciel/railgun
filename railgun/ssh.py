@@ -1,0 +1,171 @@
+"""Utility module to handle the shared ssh connection."""
+import json
+import logging
+from contextlib import contextmanager
+
+import paramiko
+import re
+
+from railgun.config import ServerConfig
+
+logger = logging.getLogger(__name__)
+
+
+class SSHCommandResult(object):
+    """Structure that returns in all ssh commands results."""
+
+    def __init__(
+            self, stdout=None, stderr=None, return_code=0):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.return_code = return_code
+        #  Does not make sense to return suspicious output if ($? <> 0)
+        if self.return_code == 0:
+            # self.stdout = json.loads(stdout) if stdout else None
+            self.stdout = stdout if stdout else None
+
+
+def _call_paramiko_sshclient():
+    """Call ``paramiko.SSHClient``.
+
+    This function does not alter the behaviour of ``paramiko.SSHClient``. It
+    exists soley for the sake of easing unit testing: it can be overridden for
+    mocking purposes.
+
+    """
+    return paramiko.SSHClient()
+
+
+@contextmanager
+def _get_connection(
+        hostname=None, auth=None, key=None, timeout=10):
+    """Yield an ssh connection object.
+
+    The connection will be configured with the specified arguments or will
+    fall-back to server configuration in the configuration file.
+
+    Yield this SSH connection. The connection is automatically closed when the
+    caller is done using it using ``contextlib``, so clients should use the
+    ``with`` statement to handle the object::
+
+        with _get_connection() as connection:
+            ...
+
+    :param str hostname: The hosname of the server to stablish connection. If
+        it is ``None`` ``server.hostname`` from configuration's ``main``
+        section will be used.
+    :param str auth: Tuple representing the username and password (optional)to
+        use when connecting.
+    :param str key: The path of the ssh private key to use when connecting to
+    the server.
+    :param int timeout: Time to wait for stablish the connection.
+
+    :return: An SSH connection.
+    :rtype: paramiko.SSHClient
+
+    """
+    settings = ServerConfig.get()
+    if hostname is None:
+        hostname = settings.host
+    if auth is None:
+        auth = settings.auth
+    if key is None:
+        key = settings.key
+
+    username, password = auth
+    client = _call_paramiko_sshclient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=hostname,
+        username=username,
+        key_filename=key,
+        timeout=timeout
+    )
+
+    client_id = hex(id(client))
+    try:
+        logger.info('Instantiated Paramiko client {0}'.format(client_id))
+        yield client
+    finally:
+        logger.info('Destroying Paramiko client {0}'.format(client_id))
+        client.close()
+        logger.info('Destroyed Paramiko client {0}'.format(client_id))
+
+
+def upload_file(local_file, remote_file=None, hostname=None):
+    """Upload a local file to a remote machine. If ``hostname`` is not provided
+    will be used the server.hostname from the cofiguration.
+
+    """
+    if not remote_file:
+        remote_file = local_file
+    with _get_connection(hostname=hostname) as connection:
+        try:
+            sftp = connection.open_sftp()
+            sftp.put(local_file, remote_file)
+        finally:
+            sftp.close()
+
+
+def download_file(remote_file, local_file=None, hostname=None):
+    """Download a remote file to the local machine. If ``hostname`` is not
+    provided will be used the server.
+
+    """
+    if local_file is None:
+        local_file = remote_file
+    with _get_connection(hostname=hostname) as connection:
+        try:
+            sftp = connection.open_sftp()
+            sftp.get(remote_file, local_file)
+        finally:
+            sftp.close()
+
+
+def command(cmd, hostname=None, output_format=None, timeout=None):
+    """
+    Executes SSH command(s) on remote hostname.
+    Defaults to main.server.hostname.
+    """
+
+    # Set a default timeout of 120 seconds
+    if timeout is None:
+        timeout = 120
+
+    # Variable to hold results returned from the command
+    stdout = stderr = errorcode = None
+
+    # Remove escape code for colors displayed in the output
+    regex = re.compile(r'\x1b\[\d\d?m')
+
+    hostname = hostname or ServerConfig.get().host
+
+    logger.debug('>>> [%s] %s', hostname, cmd)
+
+    with _get_connection(hostname=hostname) as connection:
+        _, stdout, stderr = connection.exec_command(cmd, timeout)
+        errorcode = stdout.channel.recv_exit_status()
+        stdout = stdout.read()
+        stderr = stderr.read()
+
+    if stdout:
+        # Convert to unicode string
+        stdout = stdout.decode('utf-8')
+        logger.debug('<<< stdout\n%s', stdout)
+    if stderr:
+        # Convert to unicode string and remove all color codes characters
+        stderr = regex.sub('', stderr.decode('utf-8'))
+        logger.debug('<<< stderr\n%s', stderr)
+
+    if stdout and output_format != 'json':
+        # For output we don't really want to see all of Rails traffic
+        # information, so strip it out.
+        # Empty fields are returned as "" which gives us u'""'
+        stdout = stdout.replace('""', '')
+        stdout = u''.join(stdout).split('\n')
+        stdout = [
+            regex.sub('', line) for line in stdout if not line.startswith('[')
+        ]
+
+    return SSHCommandResult(
+        stdout, stderr, errorcode)
